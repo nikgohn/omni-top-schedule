@@ -1,71 +1,42 @@
-# Security Review — Omni TOP (web/Capacitor MVP)
+# Security — Omni TOP
 
-Статический разбор этого репозитория (`omni-top-schedule`) и связанного нативного APK
-`2.0-native`. Находки привязаны к конкретным файлам. Детальный разбор APK — см.
-[REVIEW.md](REVIEW.md).
+Фокусный разбор безопасности. Привязка к файлам `main`. Общий code review — в
+[REVIEW.md](REVIEW.md). OWASP MASVS в скобках.
 
-## 🔴 Критично (нативная сборка APK)
+## 🔴 Критично
 
-1. **Release-APK подписан debug-ключом** (`CN=Android Debug, O=Android, C=US`, только v2).
-   Google Play не примет; при утечке debug-keystore возможна подмена обновлений.
-   → release-keystore, подписи v2+v3.
-2. **Учётные данные в открытом виде + `allowBackup=true`** (нативный код):
-   `SharedPreferences("omni_native_session")` с plaintext-паролем и сессией, без
-   `dataExtractionRules`. → EncryptedSharedPreferences / Keystore; `allowBackup=false`.
+| # | Файл | Проблема | Фикс |
+|---|---|---|---|
+| S1 | `android/app/build.gradle` | release подписан `signingConfigs.debug` → APK с `CN=Android Debug` (только v2) | release-keystore из `keystore.properties`, v2+v3 (MASVS-RESILIENCE) |
+| S2 | `android/app/build.gradle` | `logging-interceptor` в `implementation` (release) → утечка `Cookie`/CSRF/логина в logcat | `debugImplementation`, подключать только при `BuildConfig.DEBUG` (MASVS-STORAGE) |
 
-## 🟠 Средне (этот репозиторий)
+## 🟠 Средне
 
-3. **Capacitor: http + cleartext** — `capacitor.config.json`:
-   `server.androidScheme: "http"`, `server.cleartext: true`. Контент WebView грузится по
-   http, разрешён cleartext-трафик. → `https`-scheme, `cleartext:false`, при необходимости
-   networkSecurityConfig.
+| # | Файл | Проблема | Фикс |
+|---|---|---|---|
+| S3 | `AndroidManifest.xml:5` | `allowBackup="true"` без `dataExtractionRules` → БД/сессия в бэкапе | `allowBackup="false"` или правила-исключения (MASVS-STORAGE) |
+| S4 | `AndroidManifest.xml:33` | `LessonDialogActivity` `exported="true"` без нужды | `exported="false"` (MASVS-PLATFORM) |
+| S5 | `res/xml/file_paths.xml` | `<external-path path="."/>` — вся внешняя папка под FileProvider | сузить `path` (MASVS-PLATFORM) |
+| S6 | `capacitor.config.json` | `androidScheme:"http"`, `cleartext:true` | `https`-scheme, `cleartext:false`, `networkSecurityConfig` (MASVS-NETWORK) |
+| S7 | `public/omniClient.js` | сессия в `localStorage` (`omni_top_session`) plaintext | не хранить в localStorage; httpOnly-cookie/нативное хранилище (MASVS-STORAGE) |
+| S8 | `public/app.js` | `innerHTML`-рендер данных портала → XSS → угон сессии (S7) | санитизация/`textContent`, CSP (MASVS-PLATFORM) |
+| S9 | `server.js` | `cors()` origin `*` + `app.listen(PORT)` на `0.0.0.0`; сессия в памяти; пароль телом по http | `cors({origin})`, listen `127.0.0.1`, TLS, TTL сессии, rate-limit (MASVS-NETWORK/AUTH) |
 
-4. **Сессия в `localStorage` в открытом виде** — `public/omniClient.js`:
-   ключ `omni_top_session` (plaintext `cookieStr` + `IdLocalHash`), плюс `omni_auth`,
-   `omni_user`. Доступна любому выполняющемуся JS, поверх http-оригина.
-   → не хранить сессию в localStorage; httpOnly-cookie / нативное хранилище; как минимум
-   не логировать и не дублировать чувствительные поля.
+## 🟢 Низко
 
-5. **Рендер данных портала через `innerHTML`** — `public/app.js`
-   (ветки, студенты, карточки, `container.innerHTML = ...`). Если данные портала содержат
-   HTML/JS → XSS, что в связке с п.4 ведёт к угону сессии. → экранировать/санитизировать,
-   использовать `textContent`/шаблоны без innerHTML, добавить CSP.
+- Подробные `console.log`/`Log` с username и состоянием сессии — вырезать в проде.
+- Нет CSP / security-заголовков (helmet) на Express.
+- Хранение темы/настроек в plaintext SharedPreferences — ок, но не смешивать с сессией.
+- Нет certificate pinning (приемлемо для этого кейса, но отметить).
 
-6. **Express: открытый CORS + listen на всех интерфейсах** — `server.js`:
-   `app.use(cors())` (Access-Control-Allow-Origin: `*`) и `app.listen(PORT)` без хоста
-   (по умолчанию `0.0.0.0`). Сервер проксирует авторизованные запросы к порталу и хранит
-   сессию в памяти процесса → любой сайт/хост в LAN может вызывать `/api/*` и пользоваться
-   чужой сессией; пароль передаётся в `req.body` по http (нет TLS).
-   → ограничить `cors({ origin: ... })`, слушать `127.0.0.1`, добавить TLS или отказаться
-   от хранения сессии на сервере, rate-limit на `/api/auth/login`.
+## Приоритет исправлений
 
-7. **Пароль через локальный сервер по http** — `server.js` `/api/auth/login` принимает
-   username/password телом по http. → TLS или логин только из клиента напрямую к порталу.
-
-## 🟢 Низко / гигиена
-
-- `server.js`/`omniParser.js`: подробные `console.log`/`console.warn` с username и
-  состоянием сессии — убрать/ограничить в проде.
-- Нет CSP, нет security-заголовков на Express (helmet).
-- `package.json`: нет тестов; `license: ISC` (в репо нет LICENSE-файла). Зависимости:
-  express ^5.3.0, capacitor ^8.6.0 — планово обновлять и прогонять `npm audit`.
-- `server.js` держит `activeOmniSession` в памяти процесса без таймаута/инвалидации.
-- Нативный APK: verbose-логирование (тег `OmniRepo`, username/ФИО), мёртвые
-  Capacitor-артефакты в assets, внутренний JSON расписания в assets.
+1. S1, S2 — до любой раздачи APK.
+2. S3–S5 — конфиг нативного приложения.
+3. S6–S9 — web-MVP (или вывод web-части из прод-сборки).
 
 ## Что уже хорошо
 
-- Запросы к порталу — по **HTTPS** (`https://omni.top-academy.ru`).
-- Корректный CSRF-flow логина (`/login/index` → token → `/auth/login` с `X-CSRF-Token`).
-- Поле пароля в UI — `type="password"` (index.html); в нативном APK — маскирование +
-  password-keyboard.
-- Детект протухшей сессии → повторный логин.
-
-## Быстрый план исправлений
-
-1. Capacitor: `androidScheme:"https"`, `cleartext:false`.
-2. Убрать сессию из localStorage; санитизировать рендер (убрать innerHTML), добавить CSP.
-3. Express: `cors({ origin: <whitelist> })`, `app.listen(PORT, '127.0.0.1')`, helmet,
-   rate-limit, не держать сессию в памяти (или с TTL).
-4. Нативная сборка: release-keystore (v2+v3), шифрование учётных данных, `allowBackup=false`,
-   вырезать release-логи.
+- Портал дергается только по HTTPS; корректный CSRF-flow логина.
+- Поле пароля — `type="password"` (web) / маскирование + password-keyboard (native).
+- Минимальные разрешения; нативный UI без WebView (в `2.0-native`).
